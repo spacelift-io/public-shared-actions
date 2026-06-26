@@ -12,9 +12,9 @@ inputs:
     description: 'Slack channel ID to send notifications to'
     required: true
   slack_usergroup_name:
-    description: 'Slack usergroup name to mention for bot failures (e.g., "backend")'
+    description: 'Slack usergroup name to mention when no responsible commit author can be identified (e.g., the bugsnag handler group "spacelift-deploy-bugsnag-backend")'
     required: false
-    default: 'backend'
+    default: 'spacelift-deploy-bugsnag-backend'
   workflow_name:
     description: 'Name of the workflow (defaults to current workflow)'
     required: false
@@ -58,7 +58,7 @@ runs:
         if [ -z "$REF" ]; then
           REF="${{ github.head_ref || github.ref_name }}"
         fi
-        
+
         # Use an array so that an empty WORKFLOW expands to zero arguments (not an empty string)
         WORKFLOW_ARGS=()
         if [ -n "$WORKFLOW" ]; then
@@ -153,85 +153,97 @@ runs:
         # Mask the raw Slack API response to prevent it from appearing in logs
         echo "::add-mask::$SLACK_USERGROUPS_RESPONSE"
 
-        # Extract Slack user IDs or fallback to email
+        # Resolve the current (latest) failing commit author to a Slack mention,
+        # falling back to the raw email if we couldn't map them.
         COMMIT_USER_ID=$(echo "$COMMIT_SLACK_RESPONSE" | jq -r '.user.id // empty' 2>/dev/null || echo "")
         COMMIT_AUTHOR="${COMMIT_USER_ID:+<@$COMMIT_USER_ID>}"
         COMMIT_AUTHOR="${COMMIT_AUTHOR:-$COMMIT_EMAIL}"
 
+        # Resolve the first failing commit author (the one who started the chain).
         INITIAL_USER_ID=$(echo "$INITIAL_FAILED_SLACK_RESPONSE" | jq -r '.user.id // empty' 2>/dev/null || echo "")
         INITIAL_AUTHOR="${INITIAL_USER_ID:+<@$INITIAL_USER_ID>}"
         INITIAL_AUTHOR="${INITIAL_AUTHOR:-$INITIAL_FAILED_EMAIL}"
 
-        # Find usergroup ID by name
+        # Find the usergroup ID for the fallback handler (e.g. the bugsnag handler).
         USERGROUP_ID=$(echo "$SLACK_USERGROUPS_RESPONSE" | jq -r --arg name "$SLACK_USERGROUP_NAME" '.usergroups[] | select(.handle == $name or .name == $name) | .id' 2>/dev/null || echo "")
-
-        # Determine message variant based on conditions
-        INCLUDE_USERGROUP=false
-        INCLUDE_INITIAL_FAILURE=false
-
-        if [[ "$COMMIT_USERNAME" == *"bot"* ]]; then
-          INCLUDE_USERGROUP=true
+        if [[ -n "$USERGROUP_ID" ]]; then
+          USERGROUP_MENTION="<!subteam^$USERGROUP_ID>"
+        else
+          USERGROUP_MENTION="@$SLACK_USERGROUP_NAME"
         fi
-        
+
+        # The latest failing run is always the run that triggered this notification.
+        LATEST_AUTHOR="$COMMIT_AUTHOR"
+        LATEST_USERNAME="$COMMIT_USERNAME"
+        LATEST_RUN_URL="$RUN_URL"
+
+        # The first failing run is the earliest failure after the last success.
+        # If we couldn't find a distinct earlier failure, the current run is the
+        # first failure too.
         if [[ "$INITIAL_FAILED_USERNAME" != "username-not-found" ]]; then
           INCLUDE_INITIAL_FAILURE=true
+          FIRST_AUTHOR="$INITIAL_AUTHOR"
+          FIRST_USERNAME="$INITIAL_FAILED_USERNAME"
+          FIRST_RUN_URL="$INITIAL_FAILED_RUN_URL"
+          FIRST_USER_ID="$INITIAL_USER_ID"
+        else
+          INCLUDE_INITIAL_FAILURE=false
+          FIRST_AUTHOR="$COMMIT_AUTHOR"
+          FIRST_USERNAME="$COMMIT_USERNAME"
+          FIRST_RUN_URL="$RUN_URL"
+          FIRST_USER_ID="$COMMIT_USER_ID"
         fi
 
-        HEADER_MESSAGE="${HEADER_MESSAGE:-"GitHub workflow run is failing on $REPO_NAME repository"}"
+        HEADER_MESSAGE="${HEADER_MESSAGE:-"Workflow failing on $REPO_NAME"}"
+        HEADER="*$HEADER_MESSAGE* 🚨"
 
-        # Build main message section
-        BLOCKS='[
-          {
-            "type": "section",
-            "text": {
-              "type": "mrkdwn",
-              "text": "*'"$HEADER_MESSAGE"'* 🚨\n\nPlease check the logs in GitHub Actions for the <'"$RUN_URL"'|failing commit>\nAuthor: '"$COMMIT_AUTHOR"' - '"$COMMIT_USERNAME"'"
-            }
-          }'
+        # Guidelines shown in both message variants.
+        GUIDELINES=$(printf '%s\n' \
+          "*Key guidelines:*" \
+          "• Add an :eyes: reaction so others know you're on it." \
+          "• Once you know the cause, reply in this thread with what happened." \
+          "• Stop the bleeding first — if the fix isn't quick, get \`main\` green the fastest way (revert, or skip a flaky test) and debug after.")
 
-        # Add initial failure section if applicable
+        # Intro paragraph depends on whether we could identify the responsible engineer
+        # (the author of the first failing commit).
+        if [[ -n "$FIRST_USER_ID" ]]; then
+          INTRO="$FIRST_AUTHOR this <$FIRST_RUN_URL|workflow> failed on your commit. Please investigate and fix it ASAP!"
+        else
+          INTRO=$(printf '%s\n\n%s' \
+            "$USERGROUP_MENTION a <$FIRST_RUN_URL|workflow> is failing and we can't identify who's responsible. Please investigate and either fix it or route it to the right team." \
+            "If the author isn't on Slack, they're likely using a non-Spacelift commit email — ping them, point them to our <https://app.notion.com/p/spacelift/a-Prerequisites-c46916cbbab842e08e556cc53402cfb8|Git config docs>, and you can hand the fix over to them.")
+        fi
+
+        # Links to the first and most recent failing runs.
         if [[ "$INCLUDE_INITIAL_FAILURE" == "true" ]]; then
-          BLOCKS+=',
-          {
-            "type": "divider"
-          },
-          {
-            "type": "section",
-            "text": {
-              "type": "mrkdwn",
-              "text": "This failure chain started with: <'"$INITIAL_FAILED_RUN_URL"'|run>\nAuthor: '"$INITIAL_AUTHOR"' - '"$INITIAL_FAILED_USERNAME"'"
-            }
-          }'
+          RUN_LINES=$(printf '%s\n%s' \
+            "*First failure* by $FIRST_AUTHOR ($FIRST_USERNAME): $FIRST_RUN_URL" \
+            "*Latest failure* by $LATEST_AUTHOR ($LATEST_USERNAME): $LATEST_RUN_URL")
+        else
+          RUN_LINES="*Failing run* by $LATEST_AUTHOR ($LATEST_USERNAME): $LATEST_RUN_URL"
         fi
 
-        # Add usergroup mention section if applicable
-        if [[ "$INCLUDE_USERGROUP" == "true" ]] && [[ -n "$USERGROUP_ID" ]]; then
-          BLOCKS+=',
-          {
-            "type": "section",
-            "text": {
-              "type": "mrkdwn",
-              "text": "<!subteam^'"$USERGROUP_ID"'>, please verify"
-            }
-          }'
-        fi
-
-        # Add troubleshooting guide section if enabled
+        # Troubleshooting guide link (only when a URL was provided).
+        TROUBLE=""
         if [[ -n "$TROUBLESHOOTING_GUIDE_URL" ]]; then
-          BLOCKS+=',
-          {
-            "type": "divider"
-          },
-          {
-            "type": "section",
-            "text": {
-              "type": "mrkdwn",
-              "text": "Troubleshooting guide: <'"$TROUBLESHOOTING_GUIDE_URL"'|View Guide>"
-            }
-          }'
+          TROUBLE="See the <$TROUBLESHOOTING_GUIDE_URL|troubleshooting guide> for help investigating."
         fi
 
-        BLOCKS+=']'
+        # Assemble the message body, separating sections with blank lines.
+        BODY="$INTRO"
+        BODY="$BODY"$'\n\n'"$GUIDELINES"
+        BODY="$BODY"$'\n\n'"$RUN_LINES"
+        if [[ -n "$TROUBLE" ]]; then
+          BODY="$BODY"$'\n\n'"$TROUBLE"
+        fi
+
+        # Build the Slack blocks with jq so all text is safely JSON-encoded.
+        BLOCKS=$(jq -n --arg header "$HEADER" --arg body "$BODY" '
+          [
+            { "type": "section", "text": { "type": "mrkdwn", "text": $header } },
+            { "type": "divider" },
+            { "type": "section", "text": { "type": "mrkdwn", "text": $body } }
+          ]')
 
         # Save to output
         echo "blocks<<EOF" >> $GITHUB_OUTPUT
