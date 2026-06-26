@@ -1,0 +1,20 @@
+{
+  "name": "upload-artifacts-parallel",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Upload subdirectories as separate artifacts in parallel",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "release": "esbuild src/index.ts --bundle --platform=node --target=node24 --format=cjs --outfile=dist/index.js"
+  },
+  "dependencies": {
+    "@actions/artifact": "^6.1.0",
+    "@actions/core": "^3.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.1.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.2.2"
+  }
+}

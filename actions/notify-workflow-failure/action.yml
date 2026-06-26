@@ -1,0 +1,250 @@
+name: 'Notify Workflow Failure'
+description: 'Sends Slack notification when a workflow fails, tracking first failure and commit authors'
+
+inputs:
+  github_token:
+    description: 'GitHub token for API access'
+    required: true
+  slack_bot_token:
+    description: 'Slack Bot OAuth Token for API access'
+    required: true
+  slack_channel_id:
+    description: 'Slack channel ID to send notifications to'
+    required: true
+  slack_usergroup_name:
+    description: 'Slack usergroup name to mention for bot failures (e.g., "backend")'
+    required: false
+    default: 'backend'
+  workflow_name:
+    description: 'Name of the workflow (defaults to current workflow)'
+    required: false
+  ref:
+    description: 'Git ref/branch (defaults to current ref)'
+    required: false
+  header_message:
+    description: 'Custom header message to include in the Slack notification'
+    required: false
+    default: ''
+  troubleshooting_guide_url:
+    description: 'URL to the troubleshooting guide'
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Get commit author info
+      shell: bash
+      id: commit-info
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+      run: |
+        COMMIT_EMAIL=$(gh api repos/${{ github.repository }}/commits/${{ github.sha }} --jq '.commit.author.email')
+        COMMIT_USERNAME=$(gh api repos/${{ github.repository }}/commits/${{ github.sha }} --jq '.author.login')
+        # Sanitize email for Slack by removing [bot] part
+        COMMIT_EMAIL=$(echo "$COMMIT_EMAIL" | sed 's/\[bot\]//g')
+        echo "email=$COMMIT_EMAIL" >> $GITHUB_OUTPUT
+        echo "username=$COMMIT_USERNAME" >> $GITHUB_OUTPUT
+
+    - name: Get first failed commit SHA after last success
+      shell: bash
+      id: failed-first
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+      run: |
+        WORKFLOW="${{ inputs.workflow_name }}"
+
+        REF="${{ inputs.ref }}"
+        if [ -z "$REF" ]; then
+          REF="${{ github.head_ref || github.ref_name }}"
+        fi
+        
+        # Use an array so that an empty WORKFLOW expands to zero arguments (not an empty string)
+        WORKFLOW_ARGS=()
+        if [ -n "$WORKFLOW" ]; then
+          WORKFLOW_ARGS=(--workflow "$WORKFLOW")
+        fi
+
+        RESULT=$(gh run list \
+        --repo "${{ github.repository }}" \
+        "${WORKFLOW_ARGS[@]}" \
+        --branch "$REF" \
+        --limit 50 \
+        --json databaseId,headSha,conclusion,status,createdAt \
+        --jq '
+        # latest success (by createdAt)
+        ([.[]
+          | select(.conclusion=="success")
+         ] |sort_by(.createdAt) | last) as $s
+
+        # latest failure after that success (by createdAt)
+        | ([.[]
+            | select((.conclusion == "failure" or .conclusion == "cancelled") and .createdAt > $s.createdAt)
+           ] | sort_by(.createdAt) | first
+          )
+        # Only return if different from current commit
+        | select(.headSha != "${{ github.sha }}")
+        | {databaseId, headSha}
+          ')
+
+        FIRST_FAILED_ID=$(echo "$RESULT" | jq -r '.databaseId')
+        FIRST_FAILED_SHA=$(echo "$RESULT" | jq -r '.headSha')
+        if [ "$FIRST_FAILED_ID" != "null" ] && [ "$FIRST_FAILED_SHA" != "null" ]; then
+          FIRST_FAILED_EMAIL=$(gh api repos/${{ github.repository }}/commits/$FIRST_FAILED_SHA --jq '.commit.author.email')
+          FIRST_FAILED_USERNAME=$(gh api repos/${{ github.repository }}/commits/$FIRST_FAILED_SHA --jq '.author.login')
+          # Sanitize email for Slack by removing [bot] part
+          FIRST_FAILED_EMAIL=$(echo "$FIRST_FAILED_EMAIL" | sed 's/\[bot\]//g')
+          echo "id=$FIRST_FAILED_ID" >> $GITHUB_OUTPUT
+          echo "sha=$FIRST_FAILED_SHA" >> $GITHUB_OUTPUT
+          echo "email=$FIRST_FAILED_EMAIL" >> $GITHUB_OUTPUT
+          echo "username=$FIRST_FAILED_USERNAME" >> $GITHUB_OUTPUT
+          echo "run_url=${{ github.server_url }}/${{ github.repository }}/actions/runs/$FIRST_FAILED_ID" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Lookup current commit author in Slack
+      id: slack-user-current
+      uses: slackapi/slack-github-action@v3.0.3
+      continue-on-error: true
+      with:
+        method: users.lookupByEmail
+        token: ${{ inputs.slack_bot_token }}
+        payload: |
+          email: "${{ steps.commit-info.outputs.email }}"
+
+    - name: Lookup initial failed commit author in Slack
+      id: slack-user-initial
+      uses: slackapi/slack-github-action@v3.0.3
+      continue-on-error: true
+      if: steps.failed-first.outputs.email != ''
+      with:
+        method: users.lookupByEmail
+        token: ${{ inputs.slack_bot_token }}
+        payload: |
+          email: "${{ steps.failed-first.outputs.email }}"
+
+    - name: Lookup usergroup by name
+      id: slack-usergroup
+      uses: slackapi/slack-github-action@v3.0.3
+      continue-on-error: true
+      with:
+        method: usergroups.list
+        token: ${{ inputs.slack_bot_token }}
+        payload: |
+          include_disabled: false
+
+    - name: Build Slack message payload
+      shell: bash
+      id: slack-payload
+      env:
+        REPO_NAME: ${{ github.repository }}
+        HEADER_MESSAGE: ${{ inputs.header_message }}
+        COMMIT_EMAIL: ${{ steps.commit-info.outputs.email }}
+        COMMIT_USERNAME: ${{ steps.commit-info.outputs.username }}
+        COMMIT_SLACK_RESPONSE: ${{ steps.slack-user-current.outputs.response }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        INITIAL_FAILED_EMAIL: ${{ steps.failed-first.outputs.email || 'null@spacelift.io' }}
+        INITIAL_FAILED_USERNAME: ${{ steps.failed-first.outputs.username || 'username-not-found' }}
+        INITIAL_FAILED_SLACK_RESPONSE: ${{ steps.slack-user-initial.outputs.response }}
+        INITIAL_FAILED_RUN_URL: ${{ steps.failed-first.outputs.run_url || 'run-url-not-found' }}
+        SLACK_USERGROUP_NAME: ${{ inputs.slack_usergroup_name }}
+        SLACK_USERGROUPS_RESPONSE: ${{ steps.slack-usergroup.outputs.response }}
+        TROUBLESHOOTING_GUIDE_URL: ${{ inputs.troubleshooting_guide_url }}
+      run: |
+        # Mask the raw Slack API response to prevent it from appearing in logs
+        echo "::add-mask::$SLACK_USERGROUPS_RESPONSE"
+
+        # Extract Slack user IDs or fallback to email
+        COMMIT_USER_ID=$(echo "$COMMIT_SLACK_RESPONSE" | jq -r '.user.id // empty' 2>/dev/null || echo "")
+        COMMIT_AUTHOR="${COMMIT_USER_ID:+<@$COMMIT_USER_ID>}"
+        COMMIT_AUTHOR="${COMMIT_AUTHOR:-$COMMIT_EMAIL}"
+
+        INITIAL_USER_ID=$(echo "$INITIAL_FAILED_SLACK_RESPONSE" | jq -r '.user.id // empty' 2>/dev/null || echo "")
+        INITIAL_AUTHOR="${INITIAL_USER_ID:+<@$INITIAL_USER_ID>}"
+        INITIAL_AUTHOR="${INITIAL_AUTHOR:-$INITIAL_FAILED_EMAIL}"
+
+        # Find usergroup ID by name
+        USERGROUP_ID=$(echo "$SLACK_USERGROUPS_RESPONSE" | jq -r --arg name "$SLACK_USERGROUP_NAME" '.usergroups[] | select(.handle == $name or .name == $name) | .id' 2>/dev/null || echo "")
+
+        # Determine message variant based on conditions
+        INCLUDE_USERGROUP=false
+        INCLUDE_INITIAL_FAILURE=false
+
+        if [[ "$COMMIT_USERNAME" == *"bot"* ]]; then
+          INCLUDE_USERGROUP=true
+        fi
+        
+        if [[ "$INITIAL_FAILED_USERNAME" != "username-not-found" ]]; then
+          INCLUDE_INITIAL_FAILURE=true
+        fi
+
+        HEADER_MESSAGE="${HEADER_MESSAGE:-"GitHub workflow run is failing on $REPO_NAME repository"}"
+
+        # Build main message section
+        BLOCKS='[
+          {
+            "type": "section",
+            "text": {
+              "type": "mrkdwn",
+              "text": "*'"$HEADER_MESSAGE"'* 🚨\n\nPlease check the logs in GitHub Actions for the <'"$RUN_URL"'|failing commit>\nAuthor: '"$COMMIT_AUTHOR"' - '"$COMMIT_USERNAME"'"
+            }
+          }'
+
+        # Add initial failure section if applicable
+        if [[ "$INCLUDE_INITIAL_FAILURE" == "true" ]]; then
+          BLOCKS+=',
+          {
+            "type": "divider"
+          },
+          {
+            "type": "section",
+            "text": {
+              "type": "mrkdwn",
+              "text": "This failure chain started with: <'"$INITIAL_FAILED_RUN_URL"'|run>\nAuthor: '"$INITIAL_AUTHOR"' - '"$INITIAL_FAILED_USERNAME"'"
+            }
+          }'
+        fi
+
+        # Add usergroup mention section if applicable
+        if [[ "$INCLUDE_USERGROUP" == "true" ]] && [[ -n "$USERGROUP_ID" ]]; then
+          BLOCKS+=',
+          {
+            "type": "section",
+            "text": {
+              "type": "mrkdwn",
+              "text": "<!subteam^'"$USERGROUP_ID"'>, please verify"
+            }
+          }'
+        fi
+
+        # Add troubleshooting guide section if enabled
+        if [[ -n "$TROUBLESHOOTING_GUIDE_URL" ]]; then
+          BLOCKS+=',
+          {
+            "type": "divider"
+          },
+          {
+            "type": "section",
+            "text": {
+              "type": "mrkdwn",
+              "text": "Troubleshooting guide: <'"$TROUBLESHOOTING_GUIDE_URL"'|View Guide>"
+            }
+          }'
+        fi
+
+        BLOCKS+=']'
+
+        # Save to output
+        echo "blocks<<EOF" >> $GITHUB_OUTPUT
+        echo "$BLOCKS" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+
+    - name: Send Slack notification
+      uses: slackapi/slack-github-action@v3.0.3
+      with:
+        method: chat.postMessage
+        token: ${{ inputs.slack_bot_token }}
+        payload: |
+          {
+            "channel": "${{ inputs.slack_channel_id }}",
+            "blocks": ${{ steps.slack-payload.outputs.blocks }}
+          }

@@ -1,0 +1,52 @@
+name: 'Purge Cloudflare Cache'
+description: 'Purge Cloudflare edge cache for one or more URL prefixes in a single zone.'
+
+inputs:
+  zone_id:
+    description: 'Cloudflare zone ID for the domain whose edge cache to purge.'
+    required: true
+  api_token:
+    description: 'Cloudflare API token with Zone:Cache Purge:Purge permission on the zone.'
+    required: true
+  purge_prefixes:
+    description: >
+      Newline-separated URL prefixes to purge. Omit the scheme (no `https://`).
+      Cloudflare treats each entry as a literal string prefix, so a trailing slash
+      matters: `downloads.spacelift.io/foo` also matches `downloads.spacelift.io/foobar`,
+      while `downloads.spacelift.io/foo/` only matches paths under `/foo/`.
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Purge Cloudflare cache
+      shell: bash
+      env:
+        ZONE_ID: ${{ inputs.zone_id }}
+        API_TOKEN: ${{ inputs.api_token }}
+        PURGE_PREFIXES: ${{ inputs.purge_prefixes }}
+      run: |
+        set -euo pipefail
+
+        # Defence-in-depth: mask the token even if the caller forgot to source it from secrets.
+        echo "::add-mask::$API_TOKEN"
+
+        BODY=$(jq -n --arg p "$PURGE_PREFIXES" \
+          '{prefixes: ($p | split("\n") | map(select(length > 0)))}')
+
+        if ! response=$(curl --fail-with-body --silent --show-error \
+            --retry 3 --retry-connrefused --retry-max-time 60 --max-time 15 \
+            -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/purge_cache" \
+            -H "Authorization: Bearer $API_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "$BODY"); then
+          printf 'ERROR: Cloudflare purge request failed: %s\n' "$response" >&2
+          exit 1
+        fi
+
+        if ! jq -e '.success == true' <<<"$response" >/dev/null 2>&1; then
+          printf 'ERROR: Cloudflare purge was not successful: %s\n' "$response" >&2
+          exit 1
+        fi
+
+        echo "Cloudflare cache purged"

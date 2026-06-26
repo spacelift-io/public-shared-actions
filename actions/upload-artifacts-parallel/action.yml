@@ -1,0 +1,21 @@
+name: "Upload Artifacts Parallel"
+description: "Uploads each subdirectory of a path as a separate artifact in parallel"
+
+inputs:
+  name:
+    description: "Artifact name prefix. Each subdirectory becomes {name}-{subdir}"
+    required: true
+  path:
+    description: "Path containing subdirectories to upload"
+    required: true
+  retention-days:
+    description: "Number of days to retain artifacts (1-90)"
+    required: false
+
+outputs:
+  artifacts:
+    description: "JSON array of uploaded artifact names"
+
+runs:
+  using: "node24"
+  main: "dist/index.js"
