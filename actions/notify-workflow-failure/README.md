@@ -5,10 +5,10 @@ A GitHub Action that sends Slack notifications when a workflow fails, providing 
 ## Features
 
 - Looks up and mentions Slack users by email from GitHub commit authors
-- Identifies the commit author of the current failed run
+- Holds the author of the first failing commit (the one who broke the build) responsible, with clear guidelines on what to do next
 - Tracks the first failed commit after the last successful run
-- Provides direct links to both the current and initial failed workflow runs
-- Detects bot commits and optionally mentions a usergroup for verification
+- Provides direct links to both the first and most recent failing workflow runs
+- Falls back to mentioning a handler usergroup (e.g. the bugsnag handler) when no responsible commit author can be identified
 - Includes a link to troubleshooting documentation
 - Sanitizes dependabot email addresses for Slack compatibility
 
@@ -46,7 +46,7 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           slack_bot_token: ${{ secrets.SLACK_BOT_TOKEN }}
           slack_channel_id: ${{ secrets.SLACK_CHANNEL_ID }}
-          slack_usergroup_name: 'backend'  # Optional: for bot failures
+          slack_usergroup_name: 'spacelift-deploy-bugsnag-backend'  # Optional: handler group mentioned when no author is found
           troubleshooting_guide_url: 'https://your-docs.com/guide'  # Optional: customize URL
 ```
 
@@ -57,7 +57,7 @@ jobs:
 | `github_token` | GitHub token for API access (use `${{ secrets.GITHUB_TOKEN }}`) | Yes | -                |
 | `slack_bot_token` | Slack Bot OAuth Token for API access | Yes | -                |
 | `slack_channel_id` | Slack channel ID to send notifications to | Yes | -                |
-| `slack_usergroup_name` | Slack usergroup name to mention for bot failures (e.g., "backend") | No | `backend`        |
+| `slack_usergroup_name` | Slack usergroup name to mention when no responsible commit author can be identified (e.g., the bugsnag handler group) | No | `spacelift-deploy-bugsnag-backend` |
 | `workflow_name` | Name of the workflow to track | No | Current workflow |
 | `ref` | Git ref/branch to track | No | Current ref      |
 | `header_message` | Custom header message in the Slack notification | No | -                |
