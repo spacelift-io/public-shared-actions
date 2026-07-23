@@ -1,0 +1,122 @@
+name: 'Refresh worker pool ASG'
+description: >
+  Start an EC2 Auto Scaling Group instance refresh and wait for it to complete.
+  AWS credentials must already be configured by the caller (e.g. via
+  aws-actions/configure-aws-credentials). The assumed role needs
+  autoscaling:StartInstanceRefresh, DescribeInstanceRefreshes and
+  DescribeAutoScalingGroups.
+
+inputs:
+  asg_name:
+    description: 'Auto Scaling group name to refresh.'
+    required: true
+  aws_region:
+    description: 'AWS region of the ASG. Defaults to the ambient region configured by the caller.'
+    required: false
+    default: ''
+  wait_timeout_minutes:
+    description: 'How long to wait for the refresh to complete before failing.'
+    required: false
+    default: '10'
+  min_healthy_percentage:
+    description: 'Minimum percent of capacity that must stay healthy during the refresh (0 = replace everything at once).'
+    required: false
+    default: '0'
+  instance_warmup_seconds:
+    description: 'Seconds a new instance must warm up before counting as ready.'
+    required: false
+    default: '0'
+
+outputs:
+  instance_refresh_id:
+    description: 'ID of the started instance refresh.'
+    value: ${{ steps.refresh.outputs.instance_refresh_id }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Refresh ASG instances and wait for completion
+      id: refresh
+      shell: bash
+      env:
+        ASG_NAME: ${{ inputs.asg_name }}
+        AWS_REGION_INPUT: ${{ inputs.aws_region }}
+        WAIT_TIMEOUT_MINUTES: ${{ inputs.wait_timeout_minutes }}
+        MIN_HEALTHY_PERCENTAGE: ${{ inputs.min_healthy_percentage }}
+        INSTANCE_WARMUP_SECONDS: ${{ inputs.instance_warmup_seconds }}
+      run: |
+        set -euo pipefail
+
+        [ -n "$ASG_NAME" ] || { echo "asg_name is required" >&2; exit 1; }
+        if [ -n "$AWS_REGION_INPUT" ]; then
+          export AWS_REGION="$AWS_REGION_INPUT"
+        fi
+
+        deadline=$(( SECONDS + WAIT_TIMEOUT_MINUTES * 60 ))
+
+        echo "Starting instance refresh for $ASG_NAME (MinHealthyPercentage=${MIN_HEALTHY_PERCENTAGE}, InstanceWarmup=${INSTANCE_WARMUP_SECONDS}s)..."
+
+        REFRESH_ID=$(aws autoscaling start-instance-refresh \
+          --auto-scaling-group-name "$ASG_NAME" \
+          --preferences "MinHealthyPercentage=${MIN_HEALTHY_PERCENTAGE},InstanceWarmup=${INSTANCE_WARMUP_SECONDS}" \
+          --query 'InstanceRefreshId' \
+          --output text)
+
+        echo "instance_refresh_id=$REFRESH_ID" >> "$GITHUB_OUTPUT"
+        echo "Instance refresh started with ID: $REFRESH_ID"
+        echo "Waiting for refresh to complete..."
+        echo "============================================"
+
+        while true; do
+          REFRESH_INFO=$(aws autoscaling describe-instance-refreshes \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --instance-refresh-ids "$REFRESH_ID" \
+            --query 'InstanceRefreshes[0]' \
+            --output json)
+
+          STATUS=$(echo "$REFRESH_INFO" | jq -r '.Status')
+          PERCENT=$(echo "$REFRESH_INFO" | jq -r '.PercentageComplete // 0')
+          INSTANCES_TO_UPDATE=$(echo "$REFRESH_INFO" | jq -r '.InstancesToUpdate // 0')
+          STATUS_REASON=$(echo "$REFRESH_INFO" | jq -r '.StatusReason // empty')
+
+          echo "Status: $STATUS | Progress: ${PERCENT}%"
+          if [ "$INSTANCES_TO_UPDATE" != "0" ]; then
+            echo "Instances to update: $INSTANCES_TO_UPDATE"
+          fi
+          if [ -n "$STATUS_REASON" ]; then
+            echo "Details: $STATUS_REASON"
+          fi
+
+          ASG_INFO=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names "$ASG_NAME" \
+            --query 'AutoScalingGroups[0]' \
+            --output json)
+          DESIRED=$(echo "$ASG_INFO" | jq -r '.DesiredCapacity')
+          IN_SERVICE=$(echo "$ASG_INFO" | jq -r '.Instances | map(select(.LifecycleState == "InService")) | length')
+          echo "ASG State: $IN_SERVICE/$DESIRED instances in service"
+          echo "--------------------------------------------"
+
+          case "$STATUS" in
+            Successful)
+              echo "============================================"
+              echo "Instance refresh completed successfully!"
+              break
+              ;;
+            Failed | Cancelled | RollbackInProgress | RollbackSuccessful | RollbackFailed)
+              echo "============================================"
+              echo "Instance refresh did not succeed: $STATUS" >&2
+              if [ -n "$STATUS_REASON" ]; then
+                echo "Failure reason: $STATUS_REASON" >&2
+              fi
+              exit 1
+              ;;
+          esac
+
+          if (( SECONDS >= deadline )); then
+            echo "============================================"
+            echo "Instance refresh did not complete within ${WAIT_TIMEOUT_MINUTES} minutes." >&2
+            exit 1
+          fi
+
+          sleep 10
+        done

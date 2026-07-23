@@ -16,6 +16,7 @@ Reference actions from your workflows:
 |--------|-------------|
 | [notify-workflow-failure](actions/notify-workflow-failure) | Sends Slack notifications when a workflow fails, tracking the first failure and commit authors |
 | [purge-cloudflare-cache](actions/purge-cloudflare-cache) | Purges the Cloudflare edge cache for one or more URL prefixes in a single zone |
+| [refresh-workerpool-asg](actions/refresh-workerpool-asg) | Starts an EC2 Auto Scaling Group instance refresh and waits for it to complete |
 | [upload-artifacts-parallel](actions/upload-artifacts-parallel) | Uploads each subdirectory of a path as a separate artifact in parallel |
 
 ## Adding a New Action
