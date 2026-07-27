@@ -79,7 +79,7 @@ runs:
 
         # latest failure after that success (by createdAt)
         | ([.[]
-            | select((.conclusion == "failure" or .conclusion == "cancelled") and .createdAt > $s.createdAt)
+            | select(.conclusion == "failure" and .createdAt > $s.createdAt)
            ] | sort_by(.createdAt) | first
           )
         # Only return if different from current commit
