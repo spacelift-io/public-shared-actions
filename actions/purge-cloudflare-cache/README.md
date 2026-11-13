@@ -34,6 +34,8 @@ Each entry is sent to Cloudflare's `purge_cache` API as a literal **string prefi
 - Omit the scheme — pass `host/path`, not `https://host/path`.
 - A trailing slash matters. `host/foo` also purges `host/foobar`; `host/foo/` only purges paths under `/foo/`.
 - Anything that begins with the entry is considered a match (no globbing).
+- Each entry is trimmed (surrounding whitespace, carriage returns included) and empty entries
+  are dropped, so a value with CRLF line endings purges the same URLs as one with LF endings.
 
 ## Inputs
 
@@ -41,7 +43,7 @@ Each entry is sent to Cloudflare's `purge_cache` API as a literal **string prefi
 |---|---|---|
 | `zone_id` | Yes | Cloudflare zone ID for the domain whose edge cache to purge. |
 | `api_token` | Yes | Cloudflare API token with `Zone:Cache Purge:Purge` permission on the zone. |
-| `purge_prefixes` | Yes | Newline-separated URL prefixes to purge.|
+| `purge_prefixes` | Yes | Newline-separated URL prefixes to purge. Entries are trimmed and empty ones dropped. |
 
 
 ## Token setup

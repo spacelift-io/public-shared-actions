@@ -11,6 +11,8 @@ inputs:
   purge_prefixes:
     description: >
       Newline-separated URL prefixes to purge. Omit the scheme (no `https://`).
+      Each entry is trimmed (surrounding whitespace, carriage returns included) and
+      empty entries are dropped.
       Cloudflare treats each entry as a literal string prefix, so a trailing slash
       matters: `downloads.spacelift.io/foo` also matches `downloads.spacelift.io/foobar`,
       while `downloads.spacelift.io/foo/` only matches paths under `/foo/`.
@@ -31,8 +33,10 @@ runs:
         # Defence-in-depth: mask the token even if the caller forgot to source it from secrets.
         echo "::add-mask::$API_TOKEN"
 
+        # Trim each entry (this strips a stray carriage return, which Cloudflare would
+        # otherwise take as part of the literal prefix) and drop the empty ones.
         BODY=$(jq -n --arg p "$PURGE_PREFIXES" \
-          '{prefixes: ($p | split("\n") | map(select(length > 0)))}')
+          '{prefixes: [$p | split("\n")[] | gsub("^\\s+|\\s+$"; "") | select(length > 0)]}')
 
         if ! response=$(curl --fail-with-body --silent --show-error \
             --retry 3 --retry-connrefused --retry-max-time 60 --max-time 15 \
